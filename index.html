@@ -714,7 +714,7 @@ body {
     </div>
 
     <div class="skip-btn-container">
-      <button class="skip-btn" onclick="pick('skip')">Don't know either song</button>
+      <button class="skip-btn" onclick="pick('skip')">Don't know / don't like either</button>
     </div>
     <div class="end-early-container">
       <button class="end-early-btn" onclick="endEarly()">See my results so far</button>
@@ -1164,18 +1164,40 @@ function showResults() {
     songList.appendChild(li);
   });
 
-  // Album rankings
+  // Album rankings — skipped songs count as dead-last (score 0)
   const albumScores = {};
-  ranked.forEach(s => {
-    if (!albumScores[s.albumId]) albumScores[s.albumId] = { name:s.album, id:s.albumId, total:0, count:0 };
-    // Use rank-based scoring: higher ranked = more points
-    const rankScore = ranked.length - ranked.indexOf(s);
+  // First, initialize with total track counts so skipped songs are factored in
+  ALBUMS.forEach(album => {
+    if (!selectedAlbums.has(album.id)) return;
+    albumScores[album.id] = {
+      name: album.name,
+      id: album.id,
+      total: 0,
+      totalTracks: album.songs.length,
+      rankedCount: 0,
+      skippedCount: 0
+    };
+  });
+  // Add rank-based scores for songs that survived
+  ranked.forEach((s, i) => {
+    if (!albumScores[s.albumId]) return;
+    const rankScore = ranked.length - i;
     albumScores[s.albumId].total += rankScore;
-    albumScores[s.albumId].count++;
+    albumScores[s.albumId].rankedCount++;
+  });
+  // Count skipped songs per album (they score 0, dragging the average down)
+  songs.forEach((s, i) => {
+    if (removedSongs.has(i) && albumScores[s.albumId]) {
+      albumScores[s.albumId].skippedCount++;
+    }
   });
 
   const albumRanked = Object.values(albumScores)
-    .map(a => ({ ...a, avg: a.total / a.count }))
+    .map(a => ({
+      ...a,
+      // Average across ALL tracks including skipped (which score 0)
+      avg: a.total / a.totalTracks
+    }))
     .sort((a, b) => b.avg - a.avg);
   const maxA = albumRanked[0]?.avg || 1;
   const minA = albumRanked[albumRanked.length - 1]?.avg || 0;
@@ -1193,7 +1215,7 @@ function showResults() {
       <div class="album-result-art">${coverHTML(a.id, 'album-result-fallback')}</div>
       <div class="album-result-info">
         <div class="album-result-name">${a.name}</div>
-        <div class="album-result-score">Avg rank score: ${Math.round(a.avg)} · ${a.count} songs</div>
+        <div class="album-result-score">Avg score: ${Math.round(a.avg)} · ${a.rankedCount} ranked${a.skippedCount ? ' · ' + a.skippedCount + ' skipped' : ''}</div>
         <div class="album-result-bar" style="width:${bar}%"></div>
       </div>`;
     albumDiv.appendChild(card);
