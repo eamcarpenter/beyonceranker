@@ -630,6 +630,21 @@ body {
   line-height: 1.6;
 }
 
+/* ===== PHASE INDICATOR ===== */
+.phase-label {
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--pink-dim);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+  font-weight: 400;
+}
+
+.phase-label span {
+  color: var(--pink);
+}
+
 /* ===== MOBILE ===== */
 @media (max-width: 600px) {
   .battle-arena { flex-direction: column; min-height: auto; }
@@ -673,6 +688,7 @@ body {
   <!-- SCREEN 2: BATTLE -->
   <div class="screen" id="screen-battle">
     <div class="progress-section">
+      <div class="phase-label" id="phase-label">Phase 1: <span>Sorting the field</span></div>
       <div class="progress-bar-track">
         <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
       </div>
@@ -790,10 +806,23 @@ ALBUMS.forEach(a => albumMap[a.id] = a);
 // ===== STATE =====
 let selectedAlbums = new Set();
 let songs = [];
-let matchupIndex = 0;
-let totalMatchups = 0;
-let currentPair = [null, null];
 let removedSongs = new Set();
+
+// Phase tracking
+let phase = 'elo'; // 'elo' | 'mergesort'
+let matchupIndex = 0;
+
+// ELO phase state
+let eloTotal = 0;
+
+// Merge sort phase state
+const TOP_N = 15;
+let mergeQueue = [];
+let currentMerge = null; // { left, right, merged, li, ri }
+let mergeSortComparisons = 0;
+let mergeSortEstimate = 0;
+let topSongs = [];       // the top N songs entering merge sort
+let bottomSongs = [];    // songs NOT in top N, keep their ELO rank
 
 // ===== HELPERS =====
 function coverHTML(albumId, cls) {
@@ -846,7 +875,7 @@ function updateCount() {
   document.getElementById('btn-start').disabled = n < 4;
 }
 
-// ===== RANKING =====
+// ===== START =====
 function startRanking() {
   songs = [];
   ALBUMS.forEach(album => {
@@ -857,78 +886,276 @@ function startRanking() {
   });
   removedSongs = new Set();
   matchupIndex = 0;
-  totalMatchups = Math.round(songs.length * 2);
+  phase = 'elo';
+  // ELO phase: ~1.5x songs for smart matchmaking
+  eloTotal = Math.round(songs.length * 1.5);
   showScreen('screen-battle');
   nextMatchup();
 }
 
-function getActive() { return songs.filter((_,i)=>!removedSongs.has(i)); }
+function getActive() { return songs.filter((_,i) => !removedSongs.has(i)); }
 
-function nextMatchup() {
-  if (matchupIndex >= totalMatchups || getActive().length < 2) { showResults(); return; }
+// ===== ELO PHASE: SMART MATCHMAKING =====
+// Pairs songs with similar scores so every matchup is meaningful.
+function eloNextMatchup() {
   const active = getActive();
   if (active.length < 2) { showResults(); return; }
-  const sorted = [...active].sort((a,b)=>a.matches-b.matches);
-  const pool = sorted.slice(0, Math.max(4, Math.ceil(sorted.length*0.5)));
-  let a = pool[Math.floor(Math.random()*pool.length)];
-  let b, tries=0;
-  do { b = active[Math.floor(Math.random()*active.length)]; tries++; } while(b===a && tries<50);
-  if (b===a) { showResults(); return; }
-  currentPair = [songs.indexOf(a), songs.indexOf(b)];
-  updateBattle(a, b);
-  updateProgress();
+
+  if (matchupIndex >= eloTotal) {
+    startMergeSortPhase();
+    return;
+  }
+
+  // Sort by ELO, then pair adjacent songs (similar skill = more informative)
+  // Also weight toward songs with fewer matches
+  const sorted = [...active].sort((a, b) => {
+    // prioritize under-matched songs, then sort by ELO
+    const matchDiff = a.matches - b.matches;
+    if (Math.abs(matchDiff) > 2) return matchDiff;
+    return b.elo - a.elo;
+  });
+
+  // Pick a song that has had few matches
+  const undermatched = sorted.filter(s => s.matches < 4);
+  const pool = undermatched.length >= 2 ? undermatched : sorted;
+
+  const a = pool[Math.floor(Math.random() * Math.min(pool.length, Math.ceil(pool.length * 0.4)))];
+
+  // Find opponent with similar ELO (± some randomness for variety)
+  const opponents = active.filter(s => s !== a);
+  opponents.sort((x, y) => Math.abs(x.elo - a.elo) - Math.abs(y.elo - a.elo));
+  // Pick from the 5 closest-rated opponents with some randomness
+  const closeOps = opponents.slice(0, Math.min(5, opponents.length));
+  const b = closeOps[Math.floor(Math.random() * closeOps.length)];
+
+  showMatchup(a, b);
 }
 
-function updateBattle(a, b) {
+// ===== MERGE SORT PHASE =====
+function startMergeSortPhase() {
+  const active = getActive();
+  if (active.length < 2) { showResults(); return; }
+
+  phase = 'mergesort';
+  matchupIndex = 0;
+
+  // Take the top N by ELO score
+  const sorted = [...active].sort((a, b) => b.elo - a.elo);
+  const n = Math.min(TOP_N, sorted.length);
+  topSongs = sorted.slice(0, n);
+  bottomSongs = sorted.slice(n);
+
+  // Initialize merge sort: each song starts as its own sorted array
+  mergeQueue = topSongs.map(s => [s]);
+  currentMerge = null;
+  mergeSortComparisons = 0;
+  // Estimate: n * ceil(log2(n)) is upper bound for merge sort comparisons
+  mergeSortEstimate = Math.ceil(n * Math.log2(n || 1));
+
+  updatePhaseUI();
+  advanceMergeSort();
+}
+
+function advanceMergeSort() {
+  // If we're mid-merge, show the next comparison
+  if (currentMerge) {
+    const { left, right, li, ri } = currentMerge;
+    if (li < left.length && ri < right.length) {
+      showMatchup(left[li], right[ri]);
+      return;
+    }
+    // One side exhausted — finish this merge
+    finishCurrentMerge();
+  }
+
+  // Start next merge or finish
+  if (mergeQueue.length <= 1) {
+    // Done! mergeQueue[0] is the fully sorted top-N
+    showResults();
+    return;
+  }
+
+  // Take next two sub-arrays to merge
+  const left = mergeQueue.shift();
+  const right = mergeQueue.shift();
+  currentMerge = { left, right, merged: [], li: 0, ri: 0 };
+  advanceMergeSort(); // will hit the showMatchup branch above
+}
+
+function finishCurrentMerge() {
+  if (!currentMerge) return;
+  const { left, right, merged, li, ri } = currentMerge;
+  // Append any remaining elements
+  for (let i = li; i < left.length; i++) merged.push(left[i]);
+  for (let i = ri; i < right.length; i++) merged.push(right[i]);
+  mergeQueue.push(merged);
+  currentMerge = null;
+}
+
+function mergeSortPick(winner) {
+  if (!currentMerge) return;
+  const { left, right, merged } = currentMerge;
+  if (winner === 'left') {
+    merged.push(left[currentMerge.li]);
+    currentMerge.li++;
+  } else {
+    merged.push(right[currentMerge.ri]);
+    currentMerge.ri++;
+  }
+  mergeSortComparisons++;
+
+  // Check if one side is now exhausted
+  if (currentMerge.li >= left.length || currentMerge.ri >= right.length) {
+    finishCurrentMerge();
+  }
+
+  updateProgress();
+  setTimeout(advanceMergeSort, 200);
+}
+
+// ===== SHARED UI =====
+function showMatchup(a, b) {
+  // Store current pair for pick()
+  const idxA = songs.indexOf(a);
+  const idxB = songs.indexOf(b);
+  window._currentPairIndices = [idxA, idxB];
+  window._currentPairSongs = [a, b];
+
   document.getElementById('title-left').textContent = a.title;
   document.getElementById('album-left').textContent = a.album;
   document.getElementById('cover-left').innerHTML = coverHTML(a.albumId, 'cover-fallback');
-
   document.getElementById('title-right').textContent = b.title;
   document.getElementById('album-right').textContent = b.album;
   document.getElementById('cover-right').innerHTML = coverHTML(b.albumId, 'cover-fallback');
+  updatePhaseUI();
+  updateProgress();
+}
+
+function updatePhaseUI() {
+  const label = document.getElementById('phase-label');
+  if (phase === 'elo') {
+    label.innerHTML = 'Phase 1: <span>Sorting the field</span>';
+  } else {
+    label.innerHTML = 'Phase 2: <span>Locking in your favorites</span>';
+  }
 }
 
 function updateProgress() {
-  const pct = Math.min(100, (matchupIndex/totalMatchups)*100);
-  document.getElementById('progress-fill').style.width = pct+'%';
-  document.getElementById('progress-text').textContent = `Matchup ${matchupIndex+1} of ${totalMatchups}`;
+  let pct, text;
+  if (phase === 'elo') {
+    pct = Math.min(100, (matchupIndex / eloTotal) * 100);
+    text = `Matchup ${matchupIndex + 1} of ~${eloTotal}`;
+  } else {
+    pct = Math.min(100, (mergeSortComparisons / mergeSortEstimate) * 100);
+    text = `Finalizing · comparison ${mergeSortComparisons + 1}`;
+  }
+  document.getElementById('progress-fill').style.width = pct + '%';
+  document.getElementById('progress-text').textContent = text;
 }
 
 function pick(choice) {
-  const [iA,iB] = currentPair;
-  if (choice==='skip') {
-    removedSongs.add(iA); removedSongs.add(iB);
-  } else {
-    const w = choice==='left'?songs[iA]:songs[iB];
-    const l = choice==='left'?songs[iB]:songs[iA];
-    const K=40, eW=1/(1+Math.pow(10,(l.elo-w.elo)/400)), eL=1-eW;
-    w.elo+=K*(1-eW); l.elo+=K*(0-eL); w.wins++; w.matches++; l.matches++;
-    const card = choice==='left'?'card-left':'card-right';
-    document.getElementById(card).classList.add('choosing');
-    setTimeout(()=>document.getElementById(card).classList.remove('choosing'),300);
+  const [iA, iB] = window._currentPairIndices;
+  const [a, b] = window._currentPairSongs;
+
+  if (choice === 'skip') {
+    // Remove both songs entirely
+    removedSongs.add(iA);
+    removedSongs.add(iB);
+    if (phase === 'mergesort' && currentMerge) {
+      // Remove both from the current merge arrays and move on
+      currentMerge.left = currentMerge.left.filter(s => s !== a && s !== b);
+      currentMerge.right = currentMerge.right.filter(s => s !== a && s !== b);
+      // Adjust indices
+      currentMerge.li = Math.min(currentMerge.li, currentMerge.left.length);
+      currentMerge.ri = Math.min(currentMerge.ri, currentMerge.right.length);
+      if (currentMerge.li >= currentMerge.left.length || currentMerge.ri >= currentMerge.right.length) {
+        finishCurrentMerge();
+      }
+      mergeSortComparisons++;
+      updateProgress();
+      setTimeout(advanceMergeSort, 200);
+    } else {
+      matchupIndex++;
+      setTimeout(nextMatchup, 200);
+    }
+    return;
   }
-  matchupIndex++;
-  setTimeout(nextMatchup,200);
+
+  // Flash chosen card
+  const cardId = choice === 'left' ? 'card-left' : 'card-right';
+  document.getElementById(cardId).classList.add('choosing');
+  setTimeout(() => document.getElementById(cardId).classList.remove('choosing'), 300);
+
+  if (phase === 'elo') {
+    // Update ELO scores
+    const w = choice === 'left' ? a : b;
+    const l = choice === 'left' ? b : a;
+    const K = 40;
+    const eW = 1 / (1 + Math.pow(10, (l.elo - w.elo) / 400));
+    const eL = 1 - eW;
+    w.elo += K * (1 - eW);
+    l.elo += K * (0 - eL);
+    w.wins++;
+    w.matches++;
+    l.matches++;
+    matchupIndex++;
+    setTimeout(nextMatchup, 200);
+  } else {
+    // Merge sort: pick winner
+    mergeSortPick(choice === 'left' ? 'left' : 'right');
+  }
 }
 
-function endEarly() { showResults(); }
+function nextMatchup() {
+  if (phase === 'elo') {
+    eloNextMatchup();
+  } else {
+    advanceMergeSort();
+  }
+}
+
+function endEarly() {
+  if (phase === 'elo') {
+    // Skip to merge sort with whatever ELO data we have
+    startMergeSortPhase();
+  } else {
+    // End merge sort early — use current partial results
+    if (currentMerge) finishCurrentMerge();
+    // Drain remaining queue by concatenating
+    while (mergeQueue.length > 1) {
+      const a = mergeQueue.shift();
+      const b = mergeQueue.shift();
+      mergeQueue.push([...a, ...b]);
+    }
+    showResults();
+  }
+}
 
 // ===== RESULTS =====
 function showResults() {
   showScreen('screen-results');
-  const active = songs.filter((_,i)=>!removedSongs.has(i));
-  const ranked = [...active].sort((a,b)=>b.elo-a.elo);
 
+  const active = getActive();
+  let ranked;
+
+  if (phase === 'mergesort' && mergeQueue.length === 1) {
+    // Merge sort completed: use precise top-N order + ELO-ranked remainder
+    ranked = [...mergeQueue[0], ...bottomSongs.filter(s => !removedSongs.has(songs.indexOf(s)))];
+  } else {
+    // Ended during ELO or early — fall back to ELO ranking
+    ranked = [...active].sort((a, b) => b.elo - a.elo);
+  }
+
+  // Song list
   const songList = document.getElementById('results-songs');
   songList.innerHTML = '';
-  ranked.forEach((s,i) => {
+  ranked.forEach((s, i) => {
     const li = document.createElement('li');
     li.className = 'result-item';
-    li.style.animationDelay = `${i*0.03}s`;
+    li.style.animationDelay = `${i * 0.03}s`;
     li.innerHTML = `
-      <div class="result-rank">${i+1}</div>
-      <div class="result-art">${coverHTML(s.albumId,'result-art-fallback')}</div>
+      <div class="result-rank">${i + 1}</div>
+      <div class="result-art">${coverHTML(s.albumId, 'result-art-fallback')}</div>
       <div class="result-info">
         <div class="result-song">${s.title}</div>
         <div class="result-album">${s.album}</div>
@@ -937,63 +1164,74 @@ function showResults() {
     songList.appendChild(li);
   });
 
+  // Album rankings
   const albumScores = {};
-  active.forEach(s => {
-    if (!albumScores[s.albumId]) albumScores[s.albumId]={name:s.album,id:s.albumId,total:0,count:0};
-    albumScores[s.albumId].total+=s.elo; albumScores[s.albumId].count++;
+  ranked.forEach(s => {
+    if (!albumScores[s.albumId]) albumScores[s.albumId] = { name:s.album, id:s.albumId, total:0, count:0 };
+    // Use rank-based scoring: higher ranked = more points
+    const rankScore = ranked.length - ranked.indexOf(s);
+    albumScores[s.albumId].total += rankScore;
+    albumScores[s.albumId].count++;
   });
-  const albumRanked = Object.values(albumScores).map(a=>({...a,avg:a.total/a.count})).sort((a,b)=>b.avg-a.avg);
-  const maxA=albumRanked[0]?.avg||1200, minA=albumRanked[albumRanked.length-1]?.avg||1200, range=maxA-minA||1;
+
+  const albumRanked = Object.values(albumScores)
+    .map(a => ({ ...a, avg: a.total / a.count }))
+    .sort((a, b) => b.avg - a.avg);
+  const maxA = albumRanked[0]?.avg || 1;
+  const minA = albumRanked[albumRanked.length - 1]?.avg || 0;
+  const range = maxA - minA || 1;
 
   const albumDiv = document.getElementById('results-albums');
   albumDiv.innerHTML = '';
-  albumRanked.forEach((a,i) => {
-    const bar = ((a.avg-minA)/range)*80+20;
+  albumRanked.forEach((a, i) => {
+    const bar = ((a.avg - minA) / range) * 80 + 20;
     const card = document.createElement('div');
     card.className = 'album-result-card';
-    card.style.animationDelay = `${i*0.06}s`;
+    card.style.animationDelay = `${i * 0.06}s`;
     card.innerHTML = `
-      <div class="album-result-rank">${i+1}</div>
-      <div class="album-result-art">${coverHTML(a.id,'album-result-fallback')}</div>
+      <div class="album-result-rank">${i + 1}</div>
+      <div class="album-result-art">${coverHTML(a.id, 'album-result-fallback')}</div>
       <div class="album-result-info">
         <div class="album-result-name">${a.name}</div>
-        <div class="album-result-score">Avg score: ${Math.round(a.avg)} · ${a.count} songs ranked</div>
+        <div class="album-result-score">Avg rank score: ${Math.round(a.avg)} · ${a.count} songs</div>
         <div class="album-result-bar" style="width:${bar}%"></div>
       </div>`;
     albumDiv.appendChild(card);
   });
 
-  const top5=ranked.slice(0,5), bot3=ranked.slice(-3).reverse();
-  let txt=`🐝 My Beyoncé Song Ranking 🐝\n\n👑 TOP 5:\n`;
-  top5.forEach((s,i)=>txt+=`${i+1}. ${s.title} (${s.album})\n`);
-  txt+=`\n📀 ALBUM RANKING:\n`;
-  albumRanked.forEach((a,i)=>txt+=`${i+1}. ${a.name}\n`);
-  txt+=`\n🔻 BOTTOM 3:\n`;
-  bot3.forEach((s,i)=>txt+=`${ranked.length-2+i}. ${s.title} (${s.album})\n`);
+  // Share text
+  const top5 = ranked.slice(0, 5);
+  const bot3 = ranked.slice(-3).reverse();
+  let txt = `🐝 My Beyoncé Song Ranking 🐝\n\n👑 TOP 5:\n`;
+  top5.forEach((s, i) => txt += `${i + 1}. ${s.title} (${s.album})\n`);
+  txt += `\n📀 ALBUM RANKING:\n`;
+  albumRanked.forEach((a, i) => txt += `${i + 1}. ${a.name}\n`);
+  txt += `\n🔻 BOTTOM 3:\n`;
+  bot3.forEach((s, i) => txt += `${ranked.length - 2 + i}. ${s.title} (${s.album})\n`);
   document.getElementById('share-text').textContent = txt;
   showTab('songs');
 }
 
 function showTab(tab) {
-  document.querySelectorAll('.results-tab').forEach(t=>t.classList.remove('active'));
-  document.getElementById('tab-songs').style.display = tab==='songs'?'':'none';
-  document.getElementById('tab-albums').style.display = tab==='albums'?'':'none';
-  document.querySelectorAll('.results-tab')[tab==='songs'?0:1].classList.add('active');
+  document.querySelectorAll('.results-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab-songs').style.display = tab === 'songs' ? '' : 'none';
+  document.getElementById('tab-albums').style.display = tab === 'albums' ? '' : 'none';
+  document.querySelectorAll('.results-tab')[tab === 'songs' ? 0 : 1].classList.add('active');
 }
 
 function copyResults() {
   const text = document.getElementById('share-text').textContent;
-  navigator.clipboard.writeText(text).then(()=>{
-    const b=event.target; b.textContent='Copied!'; setTimeout(()=>b.textContent='Copy to Clipboard',2000);
-  }).catch(()=>{ const t=document.createElement('textarea'); t.value=text; document.body.appendChild(t); t.select(); document.execCommand('copy'); document.body.removeChild(t); });
+  navigator.clipboard.writeText(text).then(() => {
+    const b = event.target; b.textContent = 'Copied!'; setTimeout(() => b.textContent = 'Copy to Clipboard', 2000);
+  }).catch(() => { const t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select(); document.execCommand('copy'); document.body.removeChild(t); });
 }
 
 function restart() { selectedAlbums.clear(); showScreen('screen-select'); init(); }
 
 function showScreen(id) {
-  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
-  window.scrollTo({top:0,behavior:'smooth'});
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
 init();
